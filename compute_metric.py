@@ -2,33 +2,67 @@ from metrics.testing_util import run_test
 import json, os
 import multiprocessing
 import numpy as np
+import os
+import psutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from typing import Dict
 from datasets import load_dataset
 
 TIMEOUT = 10
+# 优化配置
+MAX_WORKERS = min(4, multiprocessing.cpu_count() // 2)  # 限制最大进程数
+BATCH_SIZE = 8  # 增加批次大小减少进程创建开销
+USE_THREADING = True  # 使用线程替代进程减少开销
 
 
-def check_correctness(sample, generation, timeout, debug=True):
-    """Check correctness of code generation with a global timeout.
-    The global timeout is to catch some extreme/rare cases not handled by the timeouts
-    inside `run_test`"""
-    def _temp_run(sample, generation, debug, result):
-        result.append(run_test(sample, test=generation, debug=debug))
-
-    manager = multiprocessing.Manager()
-    result = manager.list()
-    p = multiprocessing.Process(target=_temp_run, args=(sample, generation, debug, result))
-    p.start()
-    p.join()
-    if p.is_alive():
-        p.kill()
-    if not result:
-        in_outs = json.loads(sample["input_output"])
-        # consider that all tests failed
-        result = [[-1 for i in range(len(in_outs["inputs"]))]]
+def check_correctness_optimized(sample, generation, timeout, debug=True):
+    """优化的代码检查函数，使用线程池减少开销"""
+    try:
+        # 直接运行测试，避免嵌套多进程
+        result = run_test_with_timeout(sample, generation, timeout, debug)
+        return result
+    except Exception as e:
         if debug:
-            print(f"global timeout")
-    return result[0]
+            print(f"Exception in check_correctness_optimized: {e}")
+        in_outs = json.loads(sample["input_output"])
+        return [[-1 for i in range(len(in_outs["inputs"]))]]
+
+def run_test_with_timeout(sample, generation, timeout, debug=True):
+    """使用线程的超时测试函数"""
+    import threading
+    import queue
+    
+    result_queue = queue.Queue()
+    
+    def worker():
+        try:
+            result = run_test(sample, test=generation, debug=debug)
+            result_queue.put(result)
+        except Exception as e:
+            if debug:
+                print(f"Worker exception: {e}")
+            result_queue.put(None)
+    
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(timeout=timeout)
+    
+    if thread.is_alive():
+        if debug:
+            print(f"Timeout after {timeout} seconds")
+        in_outs = json.loads(sample["input_output"])
+        return [[-1 for i in range(len(in_outs["inputs"]))]]
+    
+    try:
+        result = result_queue.get_nowait()
+        return result if result is not None else [[-1]]
+    except queue.Empty:
+        if debug:
+            print("Queue empty, returning timeout")
+        in_outs = json.loads(sample["input_output"])
+        return [[-1 for i in range(len(in_outs["inputs"]))]]
 
 def load_generation(input_file):
     generations = {}
@@ -116,29 +150,118 @@ def evaluate_generations_parallel(generations, samples, idx=None, debug=False):
     return results
 
 def evaluate_generations_parallel_fixed(generations, samples, debug=False):
-    """修复版本的并行评估函数"""
+    """修复版本的并行评估函数 - 优化资源使用"""
     assert len(generations.keys()) == len(samples)
     
-    # 使用更安全的多进程方式
-    with multiprocessing.get_context("spawn").Pool(multiprocessing.cpu_count()) as pool:
+    # 根据系统资源动态调整工作进程数
+    cpu_count = multiprocessing.cpu_count()
+    available_memory = psutil.virtual_memory().available / (1024**3)  # GB
+    
+    # 根据内存和CPU限制工作进程数
+    if available_memory < 8:  # 内存小于8GB
+        max_workers = min(2, cpu_count // 2)
+    elif available_memory < 16:  # 内存小于16GB
+        max_workers = min(4, cpu_count // 2)
+    else:
+        max_workers = min(MAX_WORKERS, cpu_count // 2)
+    
+    print(f"Using {max_workers} workers (CPU: {cpu_count}, Memory: {available_memory:.1f}GB)")
+    
+    if USE_THREADING and max_workers <= 4:
+        # 对于少量工作进程，使用线程池减少开销
+        return evaluate_with_threading(generations, samples, max_workers, debug)
+    else:
+        # 使用多进程处理CPU密集型任务
+        return evaluate_with_processes(generations, samples, max_workers, debug)
+
+def evaluate_with_threading(generations, samples, max_workers, debug=False):
+    """使用线程池进行评估"""
+    results = {}
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务
+        future_to_task = {
+            executor.submit(process_generation_threaded, task_id, samples[i], problem_generations, debug): task_id
+            for i, (task_id, problem_generations) in enumerate(generations.items())
+        }
+        
+        # 收集结果
+        for future in as_completed(future_to_task):
+            task_id = future_to_task[future]
+            try:
+                task_id, res = future.result()
+                results[task_id] = res
+            except Exception as e:
+                print(f"Task {task_id} failed: {e}")
+                results[task_id] = [[-2]]
+    
+    return results
+
+def evaluate_with_processes(generations, samples, max_workers, debug=False):
+    """使用进程池进行评估"""
+    with multiprocessing.get_context("spawn").Pool(max_workers) as pool:
         args = [(task_id, samples[i], problem_generations, debug) 
                 for i, (task_id, problem_generations) in enumerate(generations.items())]
         
-        # 使用imap_unordered提高性能
-        results_list = list(pool.imap_unordered(process_generation_fixed, args))
+        # 使用分批处理避免内存问题
+        batch_size = BATCH_SIZE
+        all_results = []
+        
+        for i in range(0, len(args), batch_size):
+            batch_args = args[i:i+batch_size]
+            batch_results = pool.map(process_generation_fixed, batch_args)
+            all_results.extend(batch_results)
+            
+            # 给系统一点喘息时间
+            if i + batch_size < len(args):
+                import time
+                time.sleep(0.1)
     
-    results = {task_id: res for task_id, res in results_list}
+    results = {task_id: res for task_id, res in all_results}
     return results
 
-def process_generation_fixed(args):
-    """修复版本的处理函数"""
+def process_generation_threaded(args):
+    """线程版本的处理函数"""
     task_id, sample, problem_generations, debug = args
     res = []
     
     for o_idx, o in enumerate(problem_generations):
         try:
-            # 使用更安全的超时处理
-            curr_res = check_correctness_safe(sample, o, timeout=TIMEOUT, debug=debug)
+            # 使用优化的检查函数
+            curr_res = check_correctness_optimized(sample, o, timeout=TIMEOUT, debug=debug)
+            
+            # 结果处理
+            fixed = []
+            for e in curr_res:
+                if isinstance(e, np.ndarray):
+                    e = e.item(0)
+                if isinstance(e, np.bool_):
+                    e = bool(e)
+                fixed.append(e)
+            curr_res = fixed
+            
+            if not np.all(curr_res) and debug:
+                print(f"Results were not True for all test cases")
+                
+        except Exception as e:
+            if debug:
+                print(f"Compilation failed, test framework exception = {repr(e)}{e}\n")
+            curr_res = [-2]  # 明确的错误标识
+        finally:
+            assert isinstance(curr_res, list)
+            res.append(curr_res)
+    
+    return task_id, res
+
+def process_generation_fixed(args):
+    """修复版本的处理函数 - 优化版本"""
+    task_id, sample, problem_generations, debug = args
+    res = []
+    
+    for o_idx, o in enumerate(problem_generations):
+        try:
+            # 使用优化的检查函数
+            curr_res = check_correctness_optimized(sample, o, timeout=TIMEOUT, debug=debug)
             
             # 结果处理
             fixed = []
@@ -164,28 +287,60 @@ def process_generation_fixed(args):
     return task_id, res
 
 def check_correctness_safe(sample, generation, timeout, debug=True):
-    """更安全的代码检查函数"""
+    """更安全的代码检查函数 - 使用优化版本"""
     try:
-        # 使用原始的check_correctness函数，但添加更好的错误处理
-        result = check_correctness(sample, generation, timeout, debug)
+        # 使用优化的检查函数
+        result = check_correctness_optimized(sample, generation, timeout, debug)
         return result
     except Exception as e:
         if debug:
             print(f"Exception in check_correctness_safe: {e}")
         return [-1]  # 超时或错误标识
 
-def batch_evaluate_generations(generations, samples, batch_size=10, debug=False):
+def batch_evaluate_generations(generations, samples, batch_size=4, debug=False):
     """批量评估以减少进程创建开销"""
-    assert len(generations.keys()) == len(samples)
+    # 移除严格断言，支持不同数量的generation
+    print(f"Found {len(generations)} generations and {len(samples)} samples")
+    
+    # 创建task_id到sample的映射
+    sample_map = {}
+    for i, sample in enumerate(samples):
+        # 如果sample有id字段，使用id作为key，否则使用index
+        if hasattr(sample, 'id') or (isinstance(sample, dict) and 'id' in sample):
+            sample_id = sample['id'] if isinstance(sample, dict) else sample.id
+        else:
+            sample_id = i
+        sample_map[sample_id] = sample
+    
+    # 只处理有对应sample的generation
+    valid_generations = {}
+    missing_samples = []
+    
+    for task_id in generations.keys():
+        if task_id in sample_map:
+            valid_generations[task_id] = generations[task_id]
+        else:
+            missing_samples.append(task_id)
+    
+    if missing_samples:
+        print(f"Warning: No matching samples found for task_ids: {missing_samples[:10]}{'...' if len(missing_samples) > 10 else ''}")
+    
+    if not valid_generations:
+        print("Error: No valid generations to evaluate")
+        return {}
+    
+    print(f"Evaluating {len(valid_generations)} valid generations")
     
     # 分批处理
-    task_ids = list(generations.keys())
+    task_ids = list(valid_generations.keys())
     results = {}
     
     for i in range(0, len(task_ids), batch_size):
         batch_task_ids = task_ids[i:i+batch_size]
-        batch_generations = {tid: generations[tid] for tid in batch_task_ids}
-        batch_samples = samples[i:i+batch_size]
+        batch_generations = {tid: valid_generations[tid] for tid in batch_task_ids}
+        
+        # 获取对应的samples
+        batch_samples = [sample_map[tid] for tid in batch_task_ids]
         
         # 对每批使用并行评估
         batch_results = evaluate_generations_parallel_fixed(batch_generations, batch_samples, debug)
@@ -245,19 +400,22 @@ def main():
     # 使用与generation相同的数据源
     taco_full = load_dataset('json', data_files='/data/lishizheng/code/peft_study/datasets-peft/TACO/taco_dataset/test_easy.json')['train'].filter(lambda entry: entry['difficulty'] in difficulties)
     
-    # 使用优化后的生成文件
-    generation_file = 'generations_optimized.json'
+    # 要测试的生成文件
+    generation_file = "taco_generation_example.json"
+    #'generations_optimized.json'
     generations = load_generation(generation_file)
     
-    # 只评估已生成的样本
-    taco_list = []
-    for idx, sample in enumerate(taco_full):
-        if idx in generations:
-            taco_list.append(sample)
+    print(f"Loaded {len(generations)} generations from {generation_file}")
+    print(f"Loaded {len(taco_full)} samples from dataset")
     
-    print(f"Evaluating {len(generations)} generated samples...")
+    # 直接传递完整的数据集，让batch_evaluate_generations处理匹配
+    print("Starting optimized evaluation...")
+    print(f"System info: CPU cores = {multiprocessing.cpu_count()}, Memory = {psutil.virtual_memory().available / (1024**3):.1f}GB")
+
+    print(f"Config: MAX_WORKERS = {MAX_WORKERS}, BATCH_SIZE = {BATCH_SIZE}, USE_THREADING = {USE_THREADING}")
+    
     # 使用修复的并行评估
-    results = batch_evaluate_generations(generations, taco_list, batch_size=5, debug=False)
+    results = batch_evaluate_generations(generations, taco_full, batch_size=BATCH_SIZE, debug=False)
     
     print("Computing metrics...")
     metrics = compute_metrics(results)
