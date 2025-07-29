@@ -115,6 +115,84 @@ def evaluate_generations_parallel(generations, samples, idx=None, debug=False):
     results = {task_id: res for task_id, res in results_list}
     return results
 
+def evaluate_generations_parallel_fixed(generations, samples, debug=False):
+    """修复版本的并行评估函数"""
+    assert len(generations.keys()) == len(samples)
+    
+    # 使用更安全的多进程方式
+    with multiprocessing.get_context("spawn").Pool(multiprocessing.cpu_count()) as pool:
+        args = [(task_id, samples[i], problem_generations, debug) 
+                for i, (task_id, problem_generations) in enumerate(generations.items())]
+        
+        # 使用imap_unordered提高性能
+        results_list = list(pool.imap_unordered(process_generation_fixed, args))
+    
+    results = {task_id: res for task_id, res in results_list}
+    return results
+
+def process_generation_fixed(args):
+    """修复版本的处理函数"""
+    task_id, sample, problem_generations, debug = args
+    res = []
+    
+    for o_idx, o in enumerate(problem_generations):
+        try:
+            # 使用更安全的超时处理
+            curr_res = check_correctness_safe(sample, o, timeout=TIMEOUT, debug=debug)
+            
+            # 结果处理
+            fixed = []
+            for e in curr_res:
+                if isinstance(e, np.ndarray):
+                    e = e.item(0)
+                if isinstance(e, np.bool_):
+                    e = bool(e)
+                fixed.append(e)
+            curr_res = fixed
+            
+            if not np.all(curr_res) and debug:
+                print(f"Results were not True for all test cases")
+                
+        except Exception as e:
+            if debug:
+                print(f"Compilation failed, test framework exception = {repr(e)}{e}\n")
+            curr_res = [-2]  # 明确的错误标识
+        finally:
+            assert isinstance(curr_res, list)
+            res.append(curr_res)
+    
+    return task_id, res
+
+def check_correctness_safe(sample, generation, timeout, debug=True):
+    """更安全的代码检查函数"""
+    try:
+        # 使用原始的check_correctness函数，但添加更好的错误处理
+        result = check_correctness(sample, generation, timeout, debug)
+        return result
+    except Exception as e:
+        if debug:
+            print(f"Exception in check_correctness_safe: {e}")
+        return [-1]  # 超时或错误标识
+
+def batch_evaluate_generations(generations, samples, batch_size=10, debug=False):
+    """批量评估以减少进程创建开销"""
+    assert len(generations.keys()) == len(samples)
+    
+    # 分批处理
+    task_ids = list(generations.keys())
+    results = {}
+    
+    for i in range(0, len(task_ids), batch_size):
+        batch_task_ids = task_ids[i:i+batch_size]
+        batch_generations = {tid: generations[tid] for tid in batch_task_ids}
+        batch_samples = samples[i:i+batch_size]
+        
+        # 对每批使用并行评估
+        batch_results = evaluate_generations_parallel_fixed(batch_generations, batch_samples, debug)
+        results.update(batch_results)
+    
+    return results
+
 def estimate_pass_at_k(num_samples, num_correct, k):
     """Estimates pass@k of each problem and returns them in an array."""
 
@@ -163,19 +241,25 @@ def main():
     # skills = ['ALL']
     # skills = ["Data structures", "Sorting", "Range queries", "Complete search", "Amortized analysis", "Dynamic programming", "Bit manipulation", "Greedy algorithms"]
 
-    from datasets import load_from_disk
-    taco = load_from_disk('/data/lishizheng/code/peft_study/datasets-peft/TACO/taco_dataset')['test'].filter(lambda entry: entry['difficulty'] in difficulties)
-    # taco = load_dataset('BAAI/TACO', split='test', skills=skills)
-
-    generation_file = 'generation.json'
+    from datasets import load_dataset
+    # 使用与generation相同的数据源
+    taco = load_dataset('json', data_files='/data/lishizheng/code/peft_study/datasets-peft/TACO/taco_dataset/test_easy.json')['train'].filter(lambda entry: entry['difficulty'] in difficulties)
+    
+    # 使用优化后的生成文件
+    generation_file = 'generations_optimized.json'
     generations = load_generation(generation_file)
 
-    results = evaluate_generations(generations, taco)
-    # You can use evaluate_generations_parallel to parallel executing multiple outputs for each problem
-    # results = evaluate_generations_parallel(generations, taco)
+    print("Starting optimized evaluation...")
+    # 使用修复的并行评估
+    results = batch_evaluate_generations(generations, taco, batch_size=5, debug=False)
+    
+    print("Computing metrics...")
     metrics = compute_metrics(results)
 
-    json.dump(metrics, open('taco_metrics.json', 'w'), indent=4)
+    # 保存优化后的结果
+    output_file = 'taco_metrics_optimized.json'
+    json.dump(metrics, open(output_file, 'w'), indent=4)
+    print(f"Evaluation completed, metrics saved to {output_file}")
 
 if __name__ == "__main__":
     main()
