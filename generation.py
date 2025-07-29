@@ -157,6 +157,25 @@ def parallel_generation(taco, n_samples, temperature, top_p, num_workers=None):
     
     return final_results
 
+# 模型单例模式
+_model_instance = None
+_tokenizer_instance = None
+
+def get_model_and_tokenizer(model_name):
+    global _model_instance, _tokenizer_instance
+    if _model_instance is None:
+        _tokenizer_instance = AutoTokenizer.from_pretrained(model_name)
+        _model_instance = AutoModelForCausalLM.from_pretrained(model_name)
+        device = "cuda:0"
+        _model_instance = _model_instance.to(device)
+        _model_instance.eval()  # 设置为评估模式
+        
+        # 设置padding token
+        if _tokenizer_instance.pad_token is None:
+            _tokenizer_instance.pad_token = _tokenizer_instance.eos_token
+            
+    return _model_instance, _tokenizer_instance
+
 # Initialize model and tokenizer
 model_name = "/data/lishizheng/.cache/huggingface/hub/models--meta-llama--Llama-3.2-3B/snapshots/13afe5124825b4f3751f836b40dafda64c1ed062"
 tokenizer = AutoTokenizer.from_pretrained(model_name)

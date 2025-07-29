@@ -243,15 +243,21 @@ def main():
 
     from datasets import load_dataset
     # 使用与generation相同的数据源
-    taco = load_dataset('json', data_files='/data/lishizheng/code/peft_study/datasets-peft/TACO/taco_dataset/test_easy.json')['train'].filter(lambda entry: entry['difficulty'] in difficulties)
+    taco_full = load_dataset('json', data_files='/data/lishizheng/code/peft_study/datasets-peft/TACO/taco_dataset/test_easy.json')['train'].filter(lambda entry: entry['difficulty'] in difficulties)
     
     # 使用优化后的生成文件
     generation_file = 'generations_optimized.json'
     generations = load_generation(generation_file)
-
-    print("Starting optimized evaluation...")
+    
+    # 只评估已生成的样本
+    taco_list = []
+    for idx, sample in enumerate(taco_full):
+        if idx in generations:
+            taco_list.append(sample)
+    
+    print(f"Evaluating {len(generations)} generated samples...")
     # 使用修复的并行评估
-    results = batch_evaluate_generations(generations, taco, batch_size=5, debug=False)
+    results = batch_evaluate_generations(generations, taco_list, batch_size=5, debug=False)
     
     print("Computing metrics...")
     metrics = compute_metrics(results)
