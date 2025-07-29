@@ -1,2 +1,3 @@
 .DS_Store
 taco_dataset/
+__pycache__/
